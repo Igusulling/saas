@@ -287,24 +287,6 @@ const AlexAgent: React.FC = () => {
       desc: "Slide through a set of images",
       icon: "🖼️🖼️",
     },
-    {
-      key: "meme",
-      label: "Meme",
-      desc: "A single-image meme post",
-      icon: "😃",
-    },
-    {
-      key: "quote",
-      label: "Quote",
-      desc: "Create posts featuring quotes",
-      icon: "💬",
-    },
-    {
-      key: "special_day",
-      label: "Special Day",
-      desc: "A single-image post for special days",
-      icon: "🎉",
-    },
   ];
 
   // Charger la configuration et les crédits au montage du composant
