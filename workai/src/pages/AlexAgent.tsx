@@ -1,5 +1,5 @@
-import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import React, { useState, useEffect } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
 import { useAuth } from "../contexts/AuthContext";
 import axios from "axios";
 
@@ -55,11 +55,14 @@ interface ContentSettings {
   showAdvancedSettings: boolean;
   uploadedImage?: File;
   uploadedImagePreview?: string;
+  carouselImages?: File[];
+  carouselImagePreviews?: string[];
 }
 
 const AlexAgent: React.FC = () => {
   const { isAuthenticated, user } = useAuth();
   const navigate = useNavigate();
+  const location = useLocation();
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   // États pour les catégories et citations
@@ -226,7 +229,7 @@ const AlexAgent: React.FC = () => {
   const [showInputScreen, setShowInputScreen] = useState(false);
   const [adInput, setAdInput] = useState("");
   const [currentScreen, setCurrentScreen] = useState<
-    "creator" | "input" | "content"
+    "creator" | "input" | "content" | "result"
   >("creator");
   const [contentSettings, setContentSettings] = useState<ContentSettings>({
     imagePrompt: "",
@@ -240,6 +243,8 @@ const AlexAgent: React.FC = () => {
     template: "ai-picked",
     mediaType: "ai-generated",
     showAdvancedSettings: false,
+    carouselImages: [],
+    carouselImagePreviews: [],
   });
 
   // Suggestions d'exemples
@@ -403,78 +408,70 @@ const AlexAgent: React.FC = () => {
     };
   };
 
+  // Ajout d'un état pour la modale de chargement
+  const [showLoadingModal, setShowLoadingModal] = useState(false);
+  // Ajout d'un état pour l'étape résultat
+  const [showResultStep, setShowResultStep] = useState(false);
+
+  // Modification de la fonction handleGenerateAd pour gérer tous les scénarios
   const handleGenerateAd = async () => {
     try {
       setIsLoading(true);
+      setShowLoadingModal(true);
       setError("");
       setGeneratedContent(null);
 
+      // Toujours prioriser le champ imagePrompt s'il est rempli
+      let topicText =
+        contentSettings.imagePrompt.trim() !== ""
+          ? contentSettings.imagePrompt
+          : adInput;
+
+      console.log("[DEBUG] Texte envoyé à l'API:", topicText);
+
       // Préparation des données pour l'API
       const apiData = {
-        topic: adInput,
-        media_type: selectedCreativeType || "single_image",
+        topic: topicText,
+        media_type: mediaType,
         input_language: "french",
         output_language: "french",
         color_palette_type: "ai_suggested",
-        video_duration: selectedCreativeType === "video" ? "short" : undefined,
+        video_duration:
+          mediaType === "video" || mediaType === "voice_over"
+            ? "short"
+            : undefined,
       };
 
-      // Si une image est uploadée, on doit d'abord l'envoyer
-      let uploadedImageUrl;
-      if (contentSettings.uploadedImage) {
-        console.log(
-          "Tentative d'upload de l'image:",
-          contentSettings.uploadedImage
-        );
-        const formData = new FormData();
-        formData.append("file", contentSettings.uploadedImage);
-
-        const uploadResponse = await axios.post(
-          "http://localhost:3000/api/predis/upload-image",
-          formData,
-          {
-            headers: {
-              "Content-Type": "multipart/form-data",
-              Accept: "application/json",
-            },
-          }
-        );
-
-        if (uploadResponse.data && uploadResponse.data.url) {
-          uploadedImageUrl = uploadResponse.data.url;
-          console.log("Image uploadée avec succès:", uploadedImageUrl);
-        } else {
-          throw new Error("Erreur lors de l'upload de l'image: URL non reçue");
-        }
-      }
-
       // Appel principal à l'API de génération
-      console.log("Données envoyées à l'API:", {
-        ...apiData,
-        uploadedImageUrl: uploadedImageUrl || undefined,
-      });
-
       const response = await axios.post(
         "http://localhost:3000/api/predis/generate",
-        {
-          ...apiData,
-          uploadedImageUrl: uploadedImageUrl || undefined,
-        }
+        apiData
       );
 
-      console.log("Réponse de l'API:", response.data);
+      // Si la génération est asynchrone (post_status: inProgress), lancer le polling
+      if (
+        response.data &&
+        response.data.post_status === "inProgress" &&
+        response.data.post_ids &&
+        response.data.post_ids.length > 0
+      ) {
+        const postId = response.data.post_ids[0];
+        console.log("[POLLING] Lancement du polling pour post_id:", postId);
+        await pollForPredisResult(postId);
+        return;
+      }
 
+      // Sinon, gestion classique (synchrone)
       setGeneratedContent({
         content: response.data.content,
         imageUrl: response.data.imageUrl,
         suggestions: response.data.suggestions,
       });
-
       if (response.data.credits) {
         setCreditInfo(response.data.credits);
       }
-
-      setCurrentScreen("content");
+      setCurrentScreen("result");
+      setShowResultStep(true);
     } catch (error) {
       console.error("Erreur lors de la génération:", error);
       if (axios.isAxiosError(error)) {
@@ -484,6 +481,54 @@ const AlexAgent: React.FC = () => {
       }
     } finally {
       setIsLoading(false);
+      setShowLoadingModal(false);
+    }
+  };
+
+  // Fonction de polling pour attendre le résultat Predis
+  const pollForPredisResult = async (postId: string) => {
+    const maxAttempts = 30; // 30 x 2s = 60s max
+    let attempts = 0;
+    let completed = false;
+    setShowLoadingModal(true);
+    setShowResultStep(false);
+
+    while (attempts < maxAttempts && !completed) {
+      try {
+        const res = await axios.get(
+          `http://localhost:3000/api/predis/result/${postId}`
+        );
+        if (res.data.status === "completed" && res.data.result) {
+          // Extraire le contenu généré du résultat webhook
+          const result = res.data.result;
+          let imageUrl = undefined;
+          if (result.generated_media && result.generated_media.length > 0) {
+            imageUrl =
+              result.generated_media[0].url_hq || result.generated_media[0].url;
+          }
+          setGeneratedContent({
+            content: result.caption ? JSON.stringify(result.caption) : "",
+            imageUrl,
+            suggestions: [],
+          });
+          setCurrentScreen("result");
+          setShowResultStep(true);
+          setShowLoadingModal(false);
+          completed = true;
+          break;
+        }
+      } catch (err) {
+        console.error("[POLLING] Erreur lors du polling:", err);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2000)); // attendre 2s
+      attempts++;
+    }
+
+    if (!completed) {
+      setError(
+        "La génération a pris trop de temps. Veuillez réessayer plus tard."
+      );
+      setShowLoadingModal(false);
     }
   };
 
@@ -506,6 +551,37 @@ const AlexAgent: React.FC = () => {
 
       handleSettingsChange("uploadedImage", file);
       handleSettingsChange("uploadedImagePreview", previewUrl);
+      handleSettingsChange("mediaType", "choose-media");
+    }
+  };
+
+  // Ajouter une fonction pour gérer l'upload multiple d'images pour le carousel
+  const handleCarouselImageUpload = (
+    event: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const files = event.target.files;
+    if (files) {
+      const newImages: File[] = [];
+      const newPreviews: string[] = [];
+
+      Array.from(files).forEach((file) => {
+        // Vérifier le type et la taille du fichier
+        if (!file.type.startsWith("image/")) {
+          alert("Veuillez sélectionner uniquement des fichiers image");
+          return;
+        }
+        if (file.size > 5 * 1024 * 1024) {
+          // 5MB max
+          alert("Les images ne doivent pas dépasser 5MB");
+          return;
+        }
+
+        newImages.push(file);
+        newPreviews.push(URL.createObjectURL(file));
+      });
+
+      handleSettingsChange("carouselImages", newImages);
+      handleSettingsChange("carouselImagePreviews", newPreviews);
       handleSettingsChange("mediaType", "choose-media");
     }
   };
@@ -1129,6 +1205,29 @@ const AlexAgent: React.FC = () => {
                     </button>
                   </div>
                 )}
+              {selectedBusinessType === "social_media" &&
+                showSocialMediaScenario &&
+                socialMediaStep === "carousel_continue" && (
+                  <div className="mt-8 animate-fade-in flex flex-col items-center">
+                    <h2 className="text-xl font-semibold mb-4">
+                      Créer un Carousel
+                    </h2>
+                    <p className="text-gray-400 mb-6">
+                      Aucun choix de format requis pour le carousel. Cliquez sur
+                      Continuer pour passer à l'étape suivante.
+                    </p>
+                    <button
+                      onClick={() => {
+                        setCurrentScreen("input");
+                        setShowInputScreen(true);
+                        setMediaType("carousel");
+                      }}
+                      className="px-8 py-3 rounded-lg font-medium bg-blue-600 hover:bg-blue-700 text-white"
+                    >
+                      Continuer
+                    </button>
+                  </div>
+                )}
             </div>
           </>
         ) : currentScreen === "input" && mediaType === "meme" ? (
@@ -1594,6 +1693,162 @@ const AlexAgent: React.FC = () => {
               </button>
             </div>
           </div>
+        ) : currentScreen === "input" && mediaType === "carousel" ? (
+          <div className="animate-fade-in">
+            {/* Bouton retour */}
+            <div className="flex items-center mb-8">
+              <button
+                onClick={() => {
+                  setCurrentScreen("creator");
+                  setShowInputScreen(false);
+                  setSocialMediaStep("carousel_continue");
+                }}
+                className="text-gray-400 hover:text-white transition-colors duration-200"
+                title="Retour à la création"
+                aria-label="Retour à la création"
+              >
+                <svg
+                  xmlns="http://www.w3.org/2000/svg"
+                  className="h-6 w-6"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                >
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M10 19l-7-7m0 0l7-7m-7 7h18"
+                  />
+                </svg>
+              </button>
+              <h2 className="text-2xl font-semibold ml-4">Créer un Carousel</h2>
+            </div>
+            <div className="flex flex-col md:flex-row gap-8">
+              {/* Partie principale : texte */}
+              <div className="flex-1">
+                <label className="block text-gray-300 mb-2">
+                  Décrivez votre carousel :
+                </label>
+                <textarea
+                  value={adInput}
+                  onChange={(e) => setAdInput(e.target.value)}
+                  className="w-full h-24 bg-[#1E1F23] text-gray-200 rounded-xl p-4 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                  placeholder="Décrivez le contenu de votre carousel..."
+                />
+              </div>
+              {/* Panneau latéral options */}
+              <div className="w-full md:w-96 space-y-6">
+                <div>
+                  <h3 className="text-gray-300 font-medium mb-2">
+                    Images du Carousel
+                  </h3>
+                  <label
+                    className={`flex-1 px-4 py-2 rounded-lg flex items-center cursor-pointer ${
+                      contentSettings.mediaType === "choose-media"
+                        ? "bg-blue-500 text-white"
+                        : "bg-[#1E1F23] text-gray-400"
+                    }`}
+                  >
+                    <input
+                      type="file"
+                      accept="image/*"
+                      multiple
+                      onChange={handleCarouselImageUpload}
+                      className="hidden"
+                      aria-label="Upload images"
+                    />
+                    ➕ Ajouter des images
+                  </label>
+                  {contentSettings.carouselImagePreviews &&
+                    contentSettings.carouselImagePreviews.length > 0 && (
+                      <div className="mt-4 grid grid-cols-2 gap-2">
+                        {contentSettings.carouselImagePreviews.map(
+                          (preview, index) => (
+                            <div key={index} className="relative">
+                              <img
+                                src={preview}
+                                alt={`Preview ${index + 1}`}
+                                className="w-full h-24 object-cover rounded-lg"
+                              />
+                              <button
+                                onClick={() => {
+                                  const newImages = [
+                                    ...(contentSettings.carouselImages || []),
+                                  ];
+                                  const newPreviews = [
+                                    ...(contentSettings.carouselImagePreviews ||
+                                      []),
+                                  ];
+                                  newImages.splice(index, 1);
+                                  newPreviews.splice(index, 1);
+                                  handleSettingsChange(
+                                    "carouselImages",
+                                    newImages
+                                  );
+                                  handleSettingsChange(
+                                    "carouselImagePreviews",
+                                    newPreviews
+                                  );
+                                }}
+                                className="absolute top-1 right-1 bg-red-500 text-white rounded-full w-6 h-6 flex items-center justify-center"
+                              >
+                                ×
+                              </button>
+                            </div>
+                          )
+                        )}
+                      </div>
+                    )}
+                </div>
+                <div>
+                  <h3 className="text-gray-300 font-medium mb-2">
+                    Nombre de variantes
+                  </h3>
+                  <input
+                    type="range"
+                    min="1"
+                    max="7"
+                    step="1"
+                    value={contentSettings.numberOfVariants}
+                    onChange={(e) =>
+                      handleSettingsChange(
+                        "numberOfVariants",
+                        parseInt(e.target.value)
+                      )
+                    }
+                    className="w-full h-1 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                    aria-label="Number of content variants"
+                  />
+                  <div className="flex justify-between text-gray-400 text-sm mt-2">
+                    <span>1</span>
+                    <span>3</span>
+                    <span>5</span>
+                    <span>7</span>
+                  </div>
+                </div>
+                <div>
+                  <h3 className="text-gray-300 font-medium mb-2">
+                    Palette de couleurs
+                  </h3>
+                  <div className="flex gap-2">
+                    <div className="flex-1 px-4 py-2 rounded-lg flex items-center bg-blue-500 text-white justify-center">
+                      IA-Générée
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="flex justify-end mt-8">
+              <button
+                onClick={handleGenerateAd}
+                className="px-8 py-3 rounded-lg font-medium bg-blue-600 hover:bg-blue-700 text-white"
+                disabled={!adInput.trim()}
+              >
+                Générer
+              </button>
+            </div>
+          </div>
         ) : (
           <div className="animate-fade-in">
             <div className="flex items-center mb-8">
@@ -2021,6 +2276,72 @@ const AlexAgent: React.FC = () => {
           </div>
         )}
       </div>
+      {showLoadingModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-60">
+          <div className="bg-[#23242a] rounded-xl p-8 flex flex-col items-center">
+            <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-blue-500 border-solid mb-6"></div>
+            <p className="text-white text-lg font-semibold">
+              Génération en cours...
+            </p>
+          </div>
+        </div>
+      )}
+      {showResultStep && currentScreen === "result" && generatedContent && (
+        <div className="min-h-screen bg-[#121316] text-white flex flex-col items-center justify-center">
+          <div className="bg-[#23242a] rounded-xl p-8 flex flex-col items-center max-w-xl w-full">
+            <h2 className="text-2xl font-bold text-green-400 mb-4">Succès !</h2>
+            {generatedContent.imageUrl && (
+              <img
+                src={generatedContent.imageUrl}
+                alt="Contenu généré"
+                className="max-w-xs rounded-lg mb-4"
+              />
+            )}
+            {/* Affichage propre du texte généré */}
+            {(() => {
+              let captionText = "";
+              try {
+                const parsed = JSON.parse(generatedContent.content);
+                if (
+                  Array.isArray(parsed) &&
+                  parsed.length > 0 &&
+                  parsed[0][0]?.caption
+                ) {
+                  captionText = parsed[0][0].caption;
+                } else if (
+                  Array.isArray(parsed) &&
+                  parsed.length > 0 &&
+                  parsed[0]?.caption
+                ) {
+                  captionText = parsed[0].caption;
+                } else if (typeof parsed === "string") {
+                  captionText = parsed;
+                }
+              } catch {
+                captionText = generatedContent.content;
+              }
+              return (
+                <div className="text-white text-lg mb-2 whitespace-pre-line text-center">
+                  {captionText}
+                </div>
+              );
+            })()}
+            {generatedContent.suggestions &&
+              generatedContent.suggestions.length > 0 && (
+                <div className="mt-4">
+                  <h3 className="text-blue-400 font-semibold mb-2">
+                    Suggestions :
+                  </h3>
+                  <ul className="list-disc list-inside text-gray-300">
+                    {generatedContent.suggestions.map((s, i) => (
+                      <li key={i}>{s}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };
